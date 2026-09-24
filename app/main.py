@@ -124,6 +124,95 @@ def validate_anchors(raw: List["Anchor"]) -> List[tuple]:
     return pts
 
 
+# ---------------------------------------------------------------- 锚点异常定位
+
+def _lis_len(items: List[tuple]) -> int:
+    """items: [(orig_ms, actual_ms)]，已按原时刻排序。
+    返回原时刻与实际时刻都严格递增的最长子序列长度。"""
+    best = 0
+    f = []
+    for i, (o, a) in enumerate(items):
+        fi = 1
+        for j in range(i):
+            oj, aj = items[j]
+            if oj < o and aj < a:
+                fi = max(fi, f[j] + 1)
+        f.append(fi)
+        best = max(best, fi)
+    return best
+
+
+def _constrained_lis(pts: List[tuple], must_keep: set, must_drop: set) -> int:
+    """在「必须保留 must_keep、必须剔除 must_drop」约束下求最长合法子序列长度；
+    约束不可行返回 -1。pts: [(orig_ms, actual_ms, line)]，已按原时刻排序。"""
+    n = len(pts)
+    ks = sorted(must_keep)
+    if any(k in must_drop for k in ks):
+        return -1
+    for a, b in zip(ks, ks[1:]):
+        if not (pts[a][0] < pts[b][0] and pts[a][1] < pts[b][1]):
+            return -1
+    # 必选点把序列切成若干段，段内独立求 LIS（段内点须与两端必选点保持严格递增）
+    total = len(ks)
+    bounds = [-1] + ks + [n]
+    for lo, hi in zip(bounds, bounds[1:]):
+        seg = []
+        for i in range(lo + 1, hi):
+            if i in must_drop:
+                continue
+            o, a = pts[i][0], pts[i][1]
+            if lo != -1 and not (pts[lo][0] < o and pts[lo][1] < a):
+                continue
+            if hi != n and not (o < pts[hi][0] and a < pts[hi][1]):
+                continue
+            seg.append((o, a))
+        total += _lis_len(seg)
+    return total
+
+
+def suggest_anchor_drops(pts: List[tuple]):
+    """从输入锚点中定位需剔除的最少锚点。
+    pts: [(orig_ms, actual_ms, line)]，line 为原输入行号（1 起）。
+    返回 (drop_lines, kept_pts)：drop_lines 为建议剔除的行号升序列表，
+    kept_pts 为保留锚点（按原时刻排序）。最长合法子序列不足 2 点时返回 None。
+    决胜规则：子序列最长 → 首尾原时刻锚点保留数量最大 → 剔除行号序列字典序最小。"""
+    pts = sorted(pts, key=lambda p: p[0])  # 稳定排序：同原时刻保持输入顺序
+    n = len(pts)
+    best = _constrained_lis(pts, set(), set())
+    if best < 2:
+        return None
+    first, last = 0, n - 1
+
+    def constrained(mk, md):
+        return _constrained_lis(pts, mk, md) == best
+
+    # 首尾原时刻锚点（排序后第一个 / 最后一个）的最大可保留数量
+    if constrained({first, last}, set()):
+        ends = 2
+    elif constrained({first}, {last}) or constrained({last}, {first}):
+        ends = 1
+    else:
+        ends = 0
+
+    def feasible(mk, md):
+        if ends == 2:
+            return constrained(mk | {first, last}, md)
+        if ends == 1:
+            return (constrained(mk | {first}, md | {last})
+                    or constrained(mk | {last}, md | {first}))
+        return constrained(mk, md | {first, last})
+
+    # 按原输入行号升序「能剔则剔」，使剔除行号序列字典序最小
+    keep, drop = set(), set()
+    for i in sorted(range(n), key=lambda i: pts[i][2]):
+        if feasible(keep, drop | {i}):
+            drop.add(i)
+        else:
+            keep.add(i)
+    kept = [p for i, p in enumerate(pts) if i not in drop]
+    return sorted(pts[i][2] for i in drop), kept
+
+
 def calibrate(entries: List[dict], map_t) -> List[dict]:
     """换算每条字幕起止时间并打问题标记。"""
     out = []
@@ -163,14 +252,8 @@ def _prepare(req: CalibrateRequest):
     return calibrate(entries, build_mapper(pts))
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-
-
-@app.post("/api/preview")
-def preview(req: CalibrateRequest):
-    rows = _prepare(req)
+def _preview_payload(rows: List[dict]) -> dict:
+    """由校准结果构造预览响应（/api/preview 与 /api/suggest 共用）。"""
     return {
         "ok": all(not r["flags"] for r in rows),
         "problem_count": sum(1 for r in rows if r["flags"]),
@@ -184,6 +267,76 @@ def preview(req: CalibrateRequest):
             }
             for r in rows
         ],
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.post("/api/preview")
+def preview(req: CalibrateRequest):
+    return _preview_payload(_prepare(req))
+
+
+@app.post("/api/suggest")
+def suggest(req: CalibrateRequest):
+    """锚点异常定位：校验失败时给出需剔除的最少锚点，并用保留锚点预演校准。"""
+    pts = []
+    for i, a in enumerate(req.anchors, 1):
+        try:
+            pts.append((parse_time(a.orig), parse_time(a.actual), i))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"锚点 {i}：{e}")
+    # SRT 仅用于预演；解析失败不阻塞定位建议
+    srt_error = None
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        entries, srt_error = None, str(e)
+    try:
+        validate_anchors(req.anchors)
+        error = None
+    except ValueError as e:
+        error = str(e)
+
+    result = suggest_anchor_drops(pts)
+    if result is None:
+        return {
+            "possible": False,
+            "error": error,
+            "message": "按原时刻排序后，原时刻与实际时刻都严格递增的锚点不足 2 个，"
+                       "无法预演。请修正或补充锚点。",
+        }
+    drop_lines, kept = result
+    kept_lines = sorted(ln for _, _, ln in kept)
+    if error is None:
+        message = "锚点校验已通过，无需剔除。"
+    else:
+        message = (
+            f"建议剔除 {len(drop_lines)} 个锚点（第 "
+            + "、".join(map(str, drop_lines))
+            + " 行），保留第 "
+            + "、".join(map(str, kept_lines))
+            + f" 行共 {len(kept)} 个锚点即可正常校准。"
+        )
+    preview_data = None
+    if entries is not None:
+        preview_data = _preview_payload(
+            calibrate(entries, build_mapper([(o, a) for o, a, _ in kept]))
+        )
+    return {
+        "possible": True,
+        "error": error,
+        "message": message,
+        "drop_lines": drop_lines,
+        "kept_anchors": [
+            {"line": ln, "orig": fmt_time(o), "actual": fmt_time(a)}
+            for o, a, ln in sorted(kept, key=lambda p: p[2])
+        ],
+        "srt_error": srt_error,
+        "preview": preview_data,
     }
 
 

@@ -21,6 +21,13 @@
   button.danger { background: #fee2e2; color: #b91c1c; padding: 4px 10px; font-size: 13px; }
   button:disabled { background: #9ca3af; cursor: not-allowed; }
   .anchor-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .anchor-row.to-drop { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px;
+             padding: 6px 8px; margin-left: -8px; margin-right: -8px; }
+  .anchor-row.to-drop input { text-decoration: line-through; border-color: #fca5a5; color: #b91c1c; }
+  .drop-tag { color: #b91c1c; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .suggest-panel { background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px;
+             padding: 12px 16px; margin: 12px 0; }
+  .suggest-panel h2 { margin-top: 4px; }
   .hint { color: #6b7280; font-size: 13px; }
   .error { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
            padding: 10px 14px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap; }
@@ -41,7 +48,8 @@
 <body>
 <h1>SRT 字幕时间校准</h1>
 <p class="hint">粘贴或上传 SRT，设置至少 2 个「原字幕时刻 → 视频实际时刻」锚点。
-相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。</p>
+相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。
+锚点校验失败时会自动给出异常定位建议（最少剔除方案），确认前不会改动你的输入。</p>
 
 <div class="card">
   <h2>1. 字幕内容</h2>
@@ -63,20 +71,25 @@
     <span class="hint" id="exportHint">请先预览，且无问题字幕时才能导出</span>
   </div>
   <div id="message"></div>
+  <div id="suggest"></div>
   <div id="result"></div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/</g, "&lt;");
 
 // 文件上传 -> 读入 textarea
 $("file").addEventListener("change", e => {
   const f = e.target.files[0];
   if (!f) return;
   const r = new FileReader();
-  r.onload = () => { $("srt").value = r.result; };
+  r.onload = () => { $("srt").value = r.result; clearSuggest(); };
   r.readAsText(f);
 });
+$("srt").addEventListener("input", clearSuggest);
+// 锚点输入一旦变化，之前的建议即失效
+$("anchors").addEventListener("input", clearSuggest);
 
 function addAnchor(orig = "", actual = "") {
   const div = document.createElement("div");
@@ -84,10 +97,16 @@ function addAnchor(orig = "", actual = "") {
   div.innerHTML =
     `<span class="hint">原时刻</span><input type="text" class="orig" placeholder="00:01:00,000" value="${orig}">` +
     `<span class="hint">→ 实际时刻</span><input type="text" class="actual" placeholder="00:01:02,500" value="${actual}">` +
-    `<button class="danger" onclick="this.parentElement.remove()">删除</button>`;
+    `<button class="danger" onclick="removeAnchor(this)">删除</button>`;
   $("anchors").appendChild(div);
+  clearSuggest();
 }
 addAnchor(); addAnchor();
+
+function removeAnchor(btn) {
+  btn.parentElement.remove();
+  clearSuggest();
+}
 
 function collectAnchors() {
   return [...document.querySelectorAll("#anchors .anchor-row")].map(row => ({
@@ -101,12 +120,94 @@ function payload() {
 }
 
 function showError(msg) {
-  $("message").innerHTML = `<div class="error">⚠ ${msg}</div>`;
+  $("message").innerHTML = `<div class="error">⚠ ${esc(msg)}</div>`;
   $("result").innerHTML = "";
   $("exportBtn").disabled = true;
 }
 
+function renderTable(data) {
+  const rows = data.entries.map(e => `
+    <tr class="${e.flags.length ? "problem" : ""}">
+      <td>${esc(e.index)}</td>
+      <td class="mono">${e.old}</td>
+      <td class="mono">${e.new}</td>
+      <td>${e.flags.map(f => `<span class="flag">${f}</span>`).join("")}</td>
+      <td class="mono">${esc(e.text)}</td>
+    </tr>`).join("");
+  return `<table>
+    <tr><th>#</th><th>原时间</th><th>校准后时间</th><th>问题</th><th>正文</th></tr>${rows}</table>`;
+}
+
+// 在锚点输入区标出建议剔除的行（仅视觉标记，不改动输入值）
+function markDropLines(lines) {
+  const set = new Set(lines);
+  let n = 0;
+  document.querySelectorAll("#anchors .anchor-row").forEach(row => {
+    const orig = row.querySelector(".orig").value.trim();
+    const actual = row.querySelector(".actual").value.trim();
+    if (!orig && !actual) return;  // 与 collectAnchors 的过滤规则一致
+    n++;
+    if (set.has(n)) {
+      row.classList.add("to-drop");
+      const tag = document.createElement("span");
+      tag.className = "drop-tag";
+      tag.textContent = "✗ 待剔除";
+      row.appendChild(tag);
+    }
+  });
+}
+
+function clearSuggest() {
+  document.querySelectorAll("#anchors .anchor-row.to-drop").forEach(row => {
+    row.classList.remove("to-drop");
+    const tag = row.querySelector(".drop-tag");
+    if (tag) tag.remove();
+  });
+  $("suggest").innerHTML = "";
+}
+
+// 确认建议：移除待剔除行，然后按原流程重新预览（之后可正常导出）
+function confirmDrops() {
+  document.querySelectorAll("#anchors .anchor-row.to-drop").forEach(r => r.remove());
+  clearSuggest();
+  preview();
+}
+
+async function fetchSuggest() {
+  let res;
+  try {
+    res = await fetch("/api/suggest", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: payload(),
+    });
+  } catch (e) { return; }  // 网络错误时只保留原错误提示
+  const data = await res.json();
+  if (!res.ok) return;     // 无法定位（如时间格式错误），只显示原错误
+  if (!data.possible) {
+    $("suggest").innerHTML = `<div class="bad-banner">✗ 无法预演：${data.message}</div>`;
+    return;
+  }
+  markDropLines(data.drop_lines);
+  const kept = data.kept_anchors
+    .map(a => `第 ${a.line} 行（${a.orig} → ${a.actual}）`).join("、");
+  const previewHtml = data.preview
+    ? `<p class="hint">以下为仅使用保留锚点的校准预览（受影响字幕），确认前输入不会被改动：</p>
+       ${renderTable(data.preview)}`
+    : `<p class="hint">字幕内容暂无法解析（${esc(data.srt_error || "未知原因")}），故不显示预演；剔除建议不受影响。</p>`;
+  $("suggest").innerHTML = `
+    <div class="suggest-panel">
+      <h2>锚点异常定位建议</h2>
+      <p>${data.message}</p>
+      <p class="hint">待剔除行已在上方标红；保留锚点：${kept || "（无）"}</p>
+      <div class="toolbar">
+        <button onclick="confirmDrops()">确认剔除并重新预览</button>
+        <button class="secondary" onclick="clearSuggest()">取消（不改动输入）</button>
+      </div>
+      ${previewHtml}
+    </div>`;
+}
+
 async function preview() {
+  clearSuggest();
   $("message").innerHTML = "";
   let res;
   try {
@@ -115,18 +216,12 @@ async function preview() {
     });
   } catch (e) { return showError("网络错误：" + e); }
   const data = await res.json();
-  if (!res.ok) return showError(data.detail || "请求失败");
+  if (!res.ok) {
+    showError(data.detail || "请求失败");
+    return fetchSuggest();  // 校验失败时自动给出异常定位建议
+  }
 
-  const rows = data.entries.map(e => `
-    <tr class="${e.flags.length ? "problem" : ""}">
-      <td>${e.index}</td>
-      <td class="mono">${e.old}</td>
-      <td class="mono">${e.new}</td>
-      <td>${e.flags.map(f => `<span class="flag">${f}</span>`).join("")}</td>
-      <td class="mono">${e.text.replace(/</g, "&lt;")}</td>
-    </tr>`).join("");
-  $("result").innerHTML = `<table>
-    <tr><th>#</th><th>原时间</th><th>校准后时间</th><th>问题</th><th>正文</th></tr>${rows}</table>`;
+  $("result").innerHTML = renderTable(data);
 
   if (data.ok) {
     $("message").innerHTML = `<div class="ok-banner">✓ 共 ${data.entries.length} 条，全部正常，可以导出。</div>`;
