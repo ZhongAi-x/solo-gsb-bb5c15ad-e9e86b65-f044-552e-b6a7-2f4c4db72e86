@@ -32,6 +32,16 @@
   th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; vertical-align: top; }
   th { background: #f9fafb; }
   tr.problem { background: #fef2f2; }
+  .anchor-row.suggested-remove { background: #fef2f2; border: 1px dashed #fca5a5;
+           border-radius: 6px; padding: 4px 6px; }
+  .anchor-row.suggested-remove input { text-decoration: line-through; }
+  .suggest-banner { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e;
+           padding: 10px 14px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap; }
+  .suggest-banner .row-list { font-family: ui-monospace, Consolas, monospace; font-weight: 600; }
+  .suggest-actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+  button.warn { background: #f59e0b; color: #1f2937; }
+  .anchor-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
+           font-family: ui-monospace, Consolas, monospace; }
   .flag { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 4px;
           padding: 1px 6px; font-size: 12px; margin-right: 4px; }
   .mono { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
@@ -41,7 +51,8 @@
 <body>
 <h1>SRT 字幕时间校准</h1>
 <p class="hint">粘贴或上传 SRT，设置至少 2 个「原字幕时刻 → 视频实际时刻」锚点。
-相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。</p>
+相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。
+锚点校验失败时会自动给出「剔除最少锚点」的修复建议，确认剔除后即可继续预演与导出。</p>
 
 <div class="card">
   <h2>1. 字幕内容</h2>
@@ -82,18 +93,36 @@ function addAnchor(orig = "", actual = "") {
   const div = document.createElement("div");
   div.className = "anchor-row";
   div.innerHTML =
+    `<span class="row-no"></span>` +
     `<span class="hint">原时刻</span><input type="text" class="orig" placeholder="00:01:00,000" value="${orig}">` +
     `<span class="hint">→ 实际时刻</span><input type="text" class="actual" placeholder="00:01:02,500" value="${actual}">` +
     `<button class="danger" onclick="this.parentElement.remove()">删除</button>`;
   $("anchors").appendChild(div);
+  numberAnchors();
 }
 addAnchor(); addAnchor();
 
+function anchorRows() {
+  // 与 collectAnchors 的过滤规则一致：返回的节点就是参与提交、带输入行号的锚点
+  return [...document.querySelectorAll("#anchors .anchor-row")]
+    .filter(row => {
+      const o = row.querySelector(".orig").value.trim();
+      const a = row.querySelector(".actual").value.trim();
+      return o || a;
+    });
+}
+
+function numberAnchors() {
+  anchorRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("anchors").addEventListener("input", () => numberAnchors());
+
 function collectAnchors() {
-  return [...document.querySelectorAll("#anchors .anchor-row")].map(row => ({
+  return anchorRows().map(row => ({
     orig: row.querySelector(".orig").value.trim(),
     actual: row.querySelector(".actual").value.trim(),
-  })).filter(a => a.orig || a.actual);
+  }));
 }
 
 function payload() {
@@ -106,8 +135,43 @@ function showError(msg) {
   $("exportBtn").disabled = true;
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function errDetail(data) {
+  return (data && typeof data.detail === "object") ? data.detail.message : (data?.detail || "请求失败");
+}
+
+function renderPreview(pv) {
+  const rows = pv.entries.map(e => `
+    <tr class="${e.flags.length ? "problem" : ""}">
+      <td>${escapeHtml(e.index)}</td>
+      <td class="mono">${escapeHtml(e.old)}</td>
+      <td class="mono">${escapeHtml(e.new)}</td>
+      <td>${e.flags.map(f => `<span class="flag">${escapeHtml(f)}</span>`).join("")}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+    </tr>`).join("");
+  $("result").innerHTML = `<table>
+    <tr><th>#</th><th>原时间</th><th>校准后时间</th><th>问题</th><th>正文</th></tr>${rows}</table>`;
+  if (pv.ok) {
+    $("message").innerHTML = `<div class="ok-banner">✓ 共 ${pv.entries.length} 条，全部正常，可以导出。</div>`;
+    $("exportBtn").disabled = false;
+  } else {
+    $("message").innerHTML = `<div class="bad-banner">✗ 发现 ${pv.problem_count} 条问题字幕（负时间 / 起止倒置 / 与下一条重叠），已禁止导出。</div>`;
+    $("exportBtn").disabled = true;
+  }
+}
+
+function clearSuggestionMarks() {
+  document.querySelectorAll("#anchors .anchor-row.suggested-remove")
+    .forEach(row => row.classList.remove("suggested-remove"));
+}
+
 async function preview() {
   $("message").innerHTML = "";
+  clearSuggestionMarks();
   let res;
   try {
     res = await fetch("/api/preview", {
@@ -115,26 +179,70 @@ async function preview() {
     });
   } catch (e) { return showError("网络错误：" + e); }
   const data = await res.json();
-  if (!res.ok) return showError(data.detail || "请求失败");
+  if (res.ok) return renderPreview(data);
 
-  const rows = data.entries.map(e => `
-    <tr class="${e.flags.length ? "problem" : ""}">
-      <td>${e.index}</td>
-      <td class="mono">${e.old}</td>
-      <td class="mono">${e.new}</td>
-      <td>${e.flags.map(f => `<span class="flag">${f}</span>`).join("")}</td>
-      <td class="mono">${e.text.replace(/</g, "&lt;")}</td>
-    </tr>`).join("");
-  $("result").innerHTML = `<table>
-    <tr><th>#</th><th>原时间</th><th>校准后时间</th><th>问题</th><th>正文</th></tr>${rows}</table>`;
-
-  if (data.ok) {
-    $("message").innerHTML = `<div class="ok-banner">✓ 共 ${data.entries.length} 条，全部正常，可以导出。</div>`;
-    $("exportBtn").disabled = false;
-  } else {
-    $("message").innerHTML = `<div class="bad-banner">✗ 发现 ${data.problem_count} 条问题字幕（负时间 / 起止倒置 / 与下一条重叠），已禁止导出。</div>`;
-    $("exportBtn").disabled = true;
+  // 锚点校验失败：请求异常定位建议
+  if (data && typeof data.detail === "object" && data.detail.type === "anchor_invalid") {
+    return showSuggestion(data.detail.message);
   }
+  return showError(errDetail(data));
+}
+
+async function showSuggestion(reason) {
+  let res;
+  try {
+    res = await fetch("/api/suggest", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: payload(),
+    });
+  } catch (e) { return showError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showError(errDetail(data));
+
+  if (!data.feasible) {
+    showError("锚点校验失败：" + reason + "\n无法预演：" + data.reason);
+    return;
+  }
+
+  const rows = anchorRows();
+  data.remove_rows.forEach(rn => {
+    const row = rows[rn - 1];
+    if (row) row.classList.add("suggested-remove");
+  });
+
+  const detail = data.removed.map(r => `#${r.row}：${r.orig || "（空）"} → ${r.actual || "（空）"} —— ${r.reason}`).join("\n");
+  $("message").innerHTML =
+    `<div class="suggest-banner">` +
+    `⚠ 锚点校验失败：${escapeHtml(reason)}\n` +
+    `建议剔除最少 <strong>${data.remove_rows.length}</strong> 个锚点：` +
+    `<span class="row-list">${data.remove_rows.map(r => "#" + r).join("、")}</span>` +
+    `（保留 ${data.kept.length} 个）。下方已用红框标出待剔除行，红色行为建议，尚未改动输入。\n` +
+    `${escapeHtml(detail)}` +
+    `<div class="suggest-actions">` +
+    `<button class="warn" onclick="confirmRemoveAnchors()">确认剔除并继续</button>` +
+    `<button class="secondary" onclick="cancelSuggestion()">放弃建议（保留输入）</button>` +
+    `</div></div>`;
+  $("exportBtn").disabled = true;
+
+  if (data.preview) {
+    renderPreview(data.preview);
+  } else {
+    $("result").innerHTML =
+      `<div class="error" style="margin-top:8px">SRT 内容无法解析，暂不能显示受影响字幕：${escapeHtml(data.preview_error || "")}</div>`;
+  }
+}
+
+function confirmRemoveAnchors() {
+  const doomed = document.querySelectorAll("#anchors .anchor-row.suggested-remove");
+  doomed.forEach(row => row.remove());
+  numberAnchors();
+  preview();
+}
+
+function cancelSuggestion() {
+  clearSuggestionMarks();
+  $("message").innerHTML = `<div class="bad-banner">已放弃建议，输入未改动。请手动修正锚点后重新预览。</div>`;
+  $("result").innerHTML = "";
+  $("exportBtn").disabled = true;
 }
 
 async function exportSrt() {
@@ -146,7 +254,7 @@ async function exportSrt() {
   } catch (e) { return showError("网络错误：" + e); }
   if (!res.ok) {
     const data = await res.json();
-    return showError(data.detail || "导出被拒绝");
+    return showError(errDetail(data) || "导出被拒绝");
   }
   const blob = await res.blob();
   const a = document.createElement("a");

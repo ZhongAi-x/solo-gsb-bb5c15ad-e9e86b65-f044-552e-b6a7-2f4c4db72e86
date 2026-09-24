@@ -124,6 +124,113 @@ def validate_anchors(raw: List["Anchor"]) -> List[tuple]:
     return pts
 
 
+def plan_anchor_suggestion(raw: List["Anchor"]) -> dict:
+    """锚点校验失败时的异常定位：求需要剔除锚点最少的修复方案。
+
+    按原时刻排序后，选出「原时刻、实际时刻都严格递增」的最长子序列（至少 2 点）。
+    多解时决胜顺序：
+      1) 最长（剔除行数最少）；
+      2) 首尾原时刻（全局最小/最大原时刻）锚点的保留数量最多；
+      3) 剔除项的原输入行号序列字典序最小。
+    返回规划字典；无法凑出 2 点时 feasible=False（无法预演）。
+    """
+    n = len(raw)
+    if n < 2:
+        return {"feasible": False, "reason": "至少需要 2 个锚点，无法预演；请补充锚点后重试。"}
+
+    parsed = []  # (输入行号, 原时刻ms, 实际时刻ms)
+    bad = {}     # 无法解析的行号 -> 原因（必然要剔除）
+    for i, a in enumerate(raw, 1):
+        try:
+            parsed.append((i, parse_time(a.orig), parse_time(a.actual)))
+        except ValueError as e:
+            bad[i] = str(e)
+    if len(parsed) < 2:
+        return {
+            "feasible": False,
+            "reason": "时间格式可解析的有效锚点不足 2 个，无法预演；请按 HH:MM:SS,mmm 修正时间格式。",
+        }
+
+    # 按原时刻排序（相同原时刻再按实际时刻、行号兜底，保证确定性）；
+    # 转移时同时要求 orig、actual 严格小于，故重复原时刻不会串链。
+    nodes = sorted(parsed, key=lambda p: (p[1], p[2], p[0]))
+    m = len(nodes)
+    row_orig = {r: o for r, o, _ in parsed}
+    row_actual = {r: c for r, _, c in parsed}
+    min_o = min(o for _, o, _ in parsed)
+    max_o = max(o for _, o, _ in parsed)
+    all_rows = set(range(1, n + 1))
+    orig_count: dict = {}
+    for _, o, _ in parsed:
+        orig_count[o] = orig_count.get(o, 0) + 1
+
+    def endpoint_hits(chain: tuple) -> int:
+        """链中属于首/尾原时刻（全局最小、最大原时刻）的锚点数。"""
+        return sum(1 for r in chain if row_orig[r] == min_o or row_orig[r] == max_o)
+
+    def better(c1: tuple, c2: tuple) -> bool:
+        """完整保留链的优劣比较：长度 > 首尾保留数 > 剔除行号序列字典序。"""
+        if len(c1) != len(c2):
+            return len(c1) > len(c2)
+        e1, e2 = endpoint_hits(c1), endpoint_hits(c2)
+        if e1 != e2:
+            return e1 > e2
+        rem1 = tuple(sorted(all_rows.difference(c1)))
+        rem2 = tuple(sorted(all_rows.difference(c2)))
+        return rem1 < rem2
+
+    # O(m^2) DP：dp[i] 为以 nodes[i] 结尾的最优保留链（链元素为输入行号）
+    dp = []
+    for i in range(m):
+        ri, oi, ai = nodes[i]
+        best = (ri,)
+        for j in range(i):
+            rj, oj, aj = nodes[j]
+            if oj < oi and aj < ai:
+                cand = (*dp[j], ri)
+                if better(cand, best):
+                    best = cand
+        dp.append(best)
+    chain = dp[0]
+    for c in dp[1:]:
+        if better(c, chain):
+            chain = c
+
+    if len(chain) < 2:
+        return {
+            "feasible": False,
+            "reason": "找不到两个原时刻与实际时刻都严格递增的锚点，无法预演；请手动修正锚点时刻。",
+        }
+
+    kept_rows = set(chain)
+    removed = []
+    for r in sorted(all_rows - kept_rows):
+        if r in bad:
+            reason = bad[r]
+        elif orig_count[row_orig[r]] > 1:
+            reason = f"原时刻 {fmt_time(row_orig[r])} 与其他锚点重复"
+        else:
+            reason = "实际时刻未随原时刻严格递增，剔除后保留锚点整体最优"
+        removed.append({
+            "row": r,
+            "orig": raw[r - 1].orig,
+            "actual": raw[r - 1].actual,
+            "reason": reason,
+        })
+    kept = [
+        {"row": r, "orig": fmt_time(row_orig[r]), "actual": fmt_time(row_actual[r])}
+        for r in chain
+    ]
+    pts = [(row_orig[r], row_actual[r]) for r in chain]
+    return {
+        "feasible": True,
+        "remove_rows": sorted(all_rows - kept_rows),
+        "kept": kept,
+        "removed": removed,
+        "_pts": pts,
+    }
+
+
 def calibrate(entries: List[dict], map_t) -> List[dict]:
     """换算每条字幕起止时间并打问题标记。"""
     out = []
@@ -154,23 +261,25 @@ class CalibrateRequest(BaseModel):
 
 
 def _prepare(req: CalibrateRequest):
-    """公共预处理，成功返回 (entries, calibrated)，失败抛 400。"""
+    """公共预处理，成功返回 (entries, calibrated)，失败抛 400。
+
+    锚点校验类错误 detail 为 {"type": "anchor_invalid", "message": ...}，
+    便于前端据此调用 /api/suggest 获取剔除建议；SRT 解析错误仍返回纯文本。
+    """
     try:
         pts = validate_anchors(req.anchors)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400, detail={"type": "anchor_invalid", "message": str(e)}
+        )
+    try:
         entries = parse_srt(req.srt)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return calibrate(entries, build_mapper(pts))
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-
-
-@app.post("/api/preview")
-def preview(req: CalibrateRequest):
-    rows = _prepare(req)
+def _preview_payload(rows: List[dict]) -> dict:
     return {
         "ok": all(not r["flags"] for r in rows),
         "problem_count": sum(1 for r in rows if r["flags"]),
@@ -185,6 +294,40 @@ def preview(req: CalibrateRequest):
             for r in rows
         ],
     }
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.post("/api/preview")
+def preview(req: CalibrateRequest):
+    rows = _prepare(req)
+    return _preview_payload(rows)
+
+
+@app.post("/api/suggest")
+def suggest(req: CalibrateRequest):
+    """锚点校验失败时的异常定位建议。
+
+    返回需要剔除的最少锚点；确认前不改动任何输入，确认后由前端按原流程
+    （/api/preview、/api/export）继续。无法凑出 2 个有效锚点时提示无法预演。
+    """
+    plan = plan_anchor_suggestion(req.anchors)
+    if not plan["feasible"]:
+        return {"feasible": False, "reason": plan["reason"]}
+
+    pts = plan.pop("_pts")
+    # 用保留锚点复用现有校准预览，展示受影响字幕；SRT 本身无法解析时仅提示
+    try:
+        rows = calibrate(parse_srt(req.srt), build_mapper(pts))
+        plan["preview"] = _preview_payload(rows)
+        plan["preview_error"] = None
+    except ValueError as e:
+        plan["preview"] = None
+        plan["preview_error"] = str(e)
+    return plan
 
 
 @app.post("/api/export")
